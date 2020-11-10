@@ -1,21 +1,30 @@
 package server
 
 import (
-	"strconv"
 	"bytes"
 	"io"
 	"log"
 	"net"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 )
 
-type HandlerFunc func(conn net.Conn)
+type HandlerFunc func(req *Request)
 
 type Server struct {
 	addr     string
 	mu       sync.RWMutex
 	handlers map[string]HandlerFunc
+}
+
+type Request struct {
+	Conn        net.Conn
+	QueryParams url.Values
+	PathParams  map[string]string
+	Headers     map[string]string
+	Body        []byte
 }
 
 func NewServer(addr string) *Server {
@@ -28,16 +37,22 @@ func (s *Server) Register(path string, handler HandlerFunc) {
 	s.handlers[path] = handler
 }
 
-func (s *Server) Start() error {
+func (s *Server) Start() (err error) {
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
+		log.Println(err)
 		return err
 	}
 	log.Println("Server is listening!")
+	defer func() {
+		if cerr := listener.Close(); cerr != nil {
+			err = cerr
+			return
+		}
+	}()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			conn.Close()
 			continue
 		}
 
@@ -48,51 +63,154 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) handle(conn net.Conn) {
+
 	defer conn.Close()
 
-	buf := make([]byte, (4096))
+	buf := make([]byte, (1024 * 8))
+	for {
+		n, err := conn.Read(buf)
+		if err == io.EOF {
+			log.Printf("%s", buf[:n])
+		}
+		if err != nil {
+			log.Println(err)
+			return
+		}
 
-	n, err := conn.Read(buf)
-	if err == io.EOF {
-		log.Printf("%s", buf[:n])
-		err = nil
+		var req Request
+		data := buf[:n]
+		rLD := []byte{'\r', '\n'}
+		rLE := bytes.Index(data, rLD)
+		if rLE == -1 {
+			log.Printf("Bad Request")
+			return
+		}
+
+		hLD := []byte{'\r', '\n', '\r', '\n'}
+		hLE := bytes.Index(data, hLD)
+		if rLE == -1 {
+			return
+		}
+
+		headersLine := string(data[rLE:hLE])
+		headers := strings.Split(headersLine, "\r\n")[1:]
+		mp := make(map[string]string)
+		for _, v := range headers {
+			headerLine := strings.Split(v, ": ")
+			mp[headerLine[0]] = headerLine[1]
+		}
+
+		req.Headers = mp
+
+		b := string(data[hLE:])
+		b = strings.Trim(b, "\r\n")
+
+		req.Body = []byte(b)
+
+		reqLine := string(data[:rLE])
+		parts := strings.Split(reqLine, " ")
+
+		if len(parts) != 3 {
+			log.Println("Error request")
+			return
+		}
+
+		path, version := parts[1], parts[2]
+		if version != "HTTP/1.1" {
+			log.Println("Error version")
+			return
+		}
+
+		decode, err := url.PathUnescape(path)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+
+		uri, err := url.ParseRequestURI(decode)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+
+		req.Conn = conn
+		req.QueryParams = uri.Query()
+
+		var handler = func(req *Request) { conn.Close() }
+
+		s.mu.RLock()
+		pParam, hr := s.checkPath(uri.Path)
+		if hr != nil {
+			handler = hr
+			req.PathParams = pParam
+		}
+		s.mu.RUnlock()
+
+		handler(&req)
+
 	}
-	if err != nil {
-		return
-	}
-	data := buf[:n]
-	requestLineDelim := []byte{'\r', '\n'}
-	requestLineEnd := bytes.Index(data, requestLineDelim)
-
-	if requestLineEnd == -1 {
-		log.Print("Error with the request line")
-		return
-	}
-
-	requestLine := string(data[:requestLineEnd])
-	parts := strings.Split(requestLine, " ")
-
-	path := parts[1]
-
-	s.mu.RLock()
-	handler, ok := s.handlers[path]
-	s.mu.RUnlock()
-	if !ok {
-		return
-	}
-	handler(conn)
-	return
 }
 
-func (s *Server) Requesting(body string) func(conn net.Conn){
+func (s *Server) checkPath(path string) (map[string]string, HandlerFunc) {
+
+	strRoutes := make([]string, len(s.handlers))
+	i := 0
+	for k := range s.handlers {
+		strRoutes[i] = k
+		i++
+	}
+
+	mp := make(map[string]string)
+
+	for i := 0; i < len(strRoutes); i++ {
+		flag := false
+		route := strRoutes[i]
+		partsRoute := strings.Split(route, "/")
+		pRotes := strings.Split(path, "/")
+
+		for j, v := range partsRoute {
+			if v != "" {
+				f := v[0:1]
+				l := v[len(v)-1:]
+				if f == "{" && l == "}" {
+					mp[v[1:len(v)-1]] = pRotes[j]
+					flag = true
+				} else if pRotes[j] != v {
+
+					strs := strings.Split(v, "{")
+					if len(strs) > 0 {
+						key := strs[1][:len(strs[1])-1]
+						mp[key] = pRotes[j][len(strs[0]):]
+						flag = true
+					} else {
+						flag = false
+						break
+					}
+				}
+				flag = true
+			}
+		}
+		if flag {
+			if hr, found := s.handlers[route]; found {
+				return mp, hr
+			}
+			break
+		}
+	}
+
+	return nil, nil
+
+}
+
+func (s *Server) Requesting(body string) func(conn net.Conn) {
 	return func(conn net.Conn) {
 		_, err := conn.Write([]byte(
 			"HTTP/1.1 200 OK\r\n" +
-			"Content-Length: " + strconv.Itoa(len(body)) + "\r\n" +
-			"Content-Type: text/html\r\n" +
-			"Connection: close\r\n" +
-			"\r\n" +
-			body,
+				"Content-Length: " + strconv.Itoa(len(body)) + "\r\n" +
+				"Content-Type: text/html\r\n" +
+				"Connection: close\r\n" +
+				"\r\n" +
+				body,
 		))
 		if err != nil {
 			log.Print(err)
