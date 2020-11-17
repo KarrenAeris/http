@@ -3,6 +3,9 @@ package banners
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/ioutil"
+	"mime/multipart"
 	"sync"
 )
 
@@ -24,6 +27,7 @@ type Banner struct {
 	Content string
 	Button  string
 	Link    string
+	Image   string
 }
 
 var sID int64 = 0
@@ -53,18 +57,47 @@ func (s *Service) ByID(ctx context.Context, id int64) (*Banner, error) {
 }
 
 //Save сохраяет/обновляет баннер.
-func (s *Service) Save(ctx context.Context, item *Banner) (*Banner, error) {
+func (s *Service) Save(ctx context.Context, item *Banner, file multipart.File) (*Banner, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	if item.ID == 0 {
 		sID++
 		item.ID = sID
+
+		//если файл пришел, то сохраняем его под нужным именем, например: сейчас там только расширение (jpg), а мы его изменим на (2.jpg)
+		if item.Image != "" {
+			//генерируем имя файла, например: если ID равно 2 и раширение файла jpg , то получим 2.jpg
+			item.Image = fmt.Sprint(item.ID) + "." + item.Image
+			//вызываем фукции для загрузки файла на сервер и передаем ему файл и path, где нужно сохранить файл  ./web/banners/2.jpg
+			err := uploadFile(file, "./web/banners/"+item.Image)
+			//если при сохранении произошла какая-нибудь ошибка, то возвращаем ошибку
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		s.items = append(s.items, item)
 		return item, nil
 	}
 	for k, v := range s.items {
 		if v.ID == item.ID {
+
+			//если файл пришел, то сохраняем его под нужным именем, например: сейчас там только расширение (jpg), а мы его изменим на (2.jpg)
+			if item.Image != "" {
+				//генерируем имя файла, например: если ID равно 2 и раширение файла jpg , то получим 2.jpg
+				item.Image = fmt.Sprint(item.ID) + "." + item.Image
+				//вызываем фукции для загрузки файла на сервер и передаем ему файл и path, где нужно сохранить файл  ./web/banners/2.jpg
+				err := uploadFile(file, "./web/banners/"+item.Image)
+				//если при сохранении произошла какая-нибудь ошибка, то возвращаем ошибку
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				//если файл не пришел, то просто поставим полученное значение в поле Image
+				item.Image = s.items[k].Image
+			}
+
 			s.items[k] = item
 			return item, nil
 		}
@@ -85,4 +118,24 @@ func (s *Service) RemoveByID(ctx context.Context, id int64) (*Banner, error) {
 	}
 
 	return nil, errors.New("item not found")
+}
+
+//эта функция сохраняет файл в сервере в заданной папке path и возвращает nil, если все успешно, -  или error, если есть ошибка
+func uploadFile(file multipart.File, path string) error {
+	//прочитаем весь файл и получаем слайс из байтов
+	var data, err = ioutil.ReadAll(file)
+	//если не удалось прочитать, вернем ошибку
+	if err != nil {
+		return errors.New("not readble data")
+	}
+
+	//записываем файл в заданной папке с публичными правами
+	err = ioutil.WriteFile(path, data, 0666)
+
+	//если не удалось записать файл, вернем ошибку
+	if err != nil {
+		return errors.New("not saved from folder ")
+	}
+
+	return nil
 }
