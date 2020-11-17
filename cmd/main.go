@@ -1,39 +1,53 @@
 package main
 
 import (
-	/*
-	"bytes"
-	"fmt"
-	"io"
-	"io/ioutil" 
-	"strings"
-	"time"
-
-	"strconv" */
-	"github.com/KarrenAeris/http/pkg/server"
 	"net"
+	"net/http"
 	"os"
-	//"log"
+	"sync"
+
+	"github.com/KarrenAeris/http/pkg/banners"
+
+	"github.com/KarrenAeris/http/cmd/app"
 )
 
 func main() {
 	host := "0.0.0.0"
 	port := "9999"
-
 	if err := execute(host, port); err != nil {
 		os.Exit(1)
 	}
 }
 
-func execute(host string, port string) error {
-	
-	srv := server.NewServer(net.JoinHostPort(host, port))
+func execute(host string, port string) (err error) {
+	mux := http.NewServeMux()
+	bannerSvc := banners.NewService()
+	server := app.NewServer(mux, bannerSvc)
+	server.Init()
+	srv := &http.Server{
+		Addr:    net.JoinHostPort(host, port),
+		Handler: mux,
+	}
 
-	// srv.Register("/", srv.Requesting("Hi there")) 
-	// srv.Register("/about", srv.Requesting("have you kept the promise?")) 
-	return srv.Start()
-	
+	return srv.ListenAndServe()
 }
 
+type handler struct {
+	mu       *sync.RWMutex
+	handlers map[string]http.HandlerFunc
+}
+
+// ServeHTPP обрабатывает все запросы
+func (h *handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	h.mu.RLock()
+	handler, ok := h.handlers[request.URL.Path]
+	h.mu.RUnlock()
+	if !ok {
+		http.Error(writer, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	}
+
+	handler(writer, request)
+}
 
 
